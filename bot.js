@@ -6,7 +6,6 @@ const fs = require('fs');
 const path = require('path');
 const express = require('express');
 
-// -------------------- TELEGRAM BOT --------------------
 const BOT_TOKEN = process.env.BOT_TOKEN;
 if (!BOT_TOKEN) {
     console.error('❌ BOT_TOKEN topilmadi! .env faylga yozing.');
@@ -20,12 +19,16 @@ bot.use((ctx, next) => {
     return next();
 });
 
+// API sozlamalari – to‘g‘ri endpoint
 const API_URL = 'https://b.kardioclinic.uz/userscha/address-a';
-const DEFAULT_LIMIT = 10000;
+const DEFAULT_LIMIT = 500;   // API 10000 gacha qabul qiladi
 const DEFAULT_ADDRESS = 'a';
 
-// Paginatsiya bilan barcha foydalanuvchilarni yuklash (timeout 60 sek, retry 3 marta)
-async function fetchAllUsersWithRetry(address = DEFAULT_ADDRESS, limit = DEFAULT_LIMIT, retries = 3) {
+// Kutish funksiyasi
+const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+// Barcha foydalanuvchilarni yuklash (paginatsiya va qayta urinish bilan)
+async function fetchAllUsers(address = DEFAULT_ADDRESS, limit = DEFAULT_LIMIT, maxRetries = 5) {
     let page = 1;
     let allUsers = [];
     let hasMore = true;
@@ -34,27 +37,46 @@ async function fetchAllUsersWithRetry(address = DEFAULT_ADDRESS, limit = DEFAULT
         let attempt = 0;
         let success = false;
         let users = [];
+        let total = 0;
 
-        while (attempt < retries && !success) {
+        while (attempt < maxRetries && !success) {
             try {
+                console.log(`📡 So‘rov: page=${page}, limit=${limit}, address=${address} (attempt ${attempt+1})`);
                 const response = await axios.get(API_URL, {
                     params: { page, limit, address },
-                    timeout: 60000, // 60 sekund
+                    timeout: 120000, // 120 sekund
+                    headers: {
+                        'User-Agent': 'Mozilla/5.0 (TelegramBot/1.0)',
+                        'Accept': 'application/json',
+                    },
                 });
-                users = response.data.users || [];
-                success = true;
+                // Javob formatini tekshirish
+                if (response.data && Array.isArray(response.data.users)) {
+                    users = response.data.users;
+                    total = response.data.total || 0;
+                    console.log(`✅ Qabul qilindi: ${users.length} ta foydalanuvchi (page ${page}), jami ${total}`);
+                    success = true;
+                } else {
+                    throw new Error('Noto‘g‘ri javob formati');
+                }
             } catch (error) {
                 attempt++;
-                console.error(`API xatosi (attempt ${attempt}/${retries}): ${error.message}`);
-                if (attempt === retries) throw new Error(`Ma'lumotlarni yuklab bo‘lmadi: ${error.message}`);
-                await new Promise(r => setTimeout(r, 2000)); // 2 sek kutish
+                console.error(`❌ API xatosi (${attempt}/${maxRetries}): ${error.message}`);
+                if (attempt === maxRetries) {
+                    throw new Error(`Ma'lumotlarni yuklab bo‘lmadi: ${error.message}`);
+                }
+                const waitTime = Math.min(30000, Math.pow(2, attempt) * 1000);
+                console.log(`⏳ ${waitTime/1000} soniya kutib, qayta uriniladi...`);
+                await delay(waitTime);
             }
         }
 
         if (users.length === 0) break;
 
         allUsers = allUsers.concat(users);
-        if (users.length < limit) {
+
+        // Agar qaytganlar soni limitdan kichik yoki jami ma'lumotlar to‘plangan bo‘lsa, to‘xtaymiz
+        if (users.length < limit || allUsers.length >= total) {
             hasMore = false;
         } else {
             page++;
@@ -63,7 +85,7 @@ async function fetchAllUsersWithRetry(address = DEFAULT_ADDRESS, limit = DEFAULT
     return allUsers;
 }
 
-// Excel generatsiyasi
+// Excel fayl yaratish
 function generateExcel(users, filename = 'users.xlsx') {
     const worksheetData = users.map(u => ({
         ID: u.id,
@@ -82,6 +104,7 @@ function generateExcel(users, filename = 'users.xlsx') {
     return filePath;
 }
 
+// Statistika (HTML)
 function getStatsByDate(users) {
     const dateCount = new Map();
     users.forEach(user => {
@@ -96,6 +119,7 @@ function getStatsByDate(users) {
     return statsText;
 }
 
+// Sana oralig‘i filtr
 function filterUsersByDateRange(users, startDate, endDate) {
     const start = new Date(startDate);
     const end = new Date(endDate);
@@ -110,7 +134,7 @@ function isValidDate(dateStr) {
     return /^\d{4}-\d{2}-\d{2}$/.test(dateStr);
 }
 
-// Bot komandalari
+// -------------------- BOT KOMANDALARI --------------------
 bot.start(async (ctx) => {
     await ctx.reply(
         '👋 <b>Kardioklinik Botiga xush kelibsiz!</b>\n\n' +
@@ -125,9 +149,9 @@ bot.start(async (ctx) => {
 });
 
 bot.command('all_excel', async (ctx) => {
-    const msg = await ctx.reply('⏳ Maʼlumotlar yuklanmoqda, iltimos kuting...');
+    const msg = await ctx.reply('⏳ Maʼlumotlar yuklanmoqda, iltimos kuting (bu bir necha daqiqa olishi mumkin)...');
     try {
-        const users = await fetchAllUsersWithRetry(DEFAULT_ADDRESS);
+        const users = await fetchAllUsers(DEFAULT_ADDRESS);
         if (!users.length) {
             await ctx.reply('Hech qanday foydalanuvchi topilmadi (address = a).');
             return;
@@ -138,14 +162,14 @@ bot.command('all_excel', async (ctx) => {
         await ctx.deleteMessage(msg.message_id);
     } catch (err) {
         console.error(err);
-        await ctx.reply('❌ Xatolik yuz berdi: ' + err.message);
+        await ctx.reply('❌ Xatolik: ' + err.message);
     }
 });
 
 bot.command('all_stats', async (ctx) => {
     const msg = await ctx.reply('⏳ Statistika tayyorlanmoqda...');
     try {
-        const users = await fetchAllUsersWithRetry(DEFAULT_ADDRESS);
+        const users = await fetchAllUsers(DEFAULT_ADDRESS);
         if (!users.length) {
             await ctx.reply('Hech qanday foydalanuvchi yo‘q (address = a).');
             return;
@@ -214,7 +238,7 @@ bot.on('text', async (ctx) => {
         await ctx.reply(`⏳ ${start} dan ${end} gacha bo‘lgan maʼlumotlar tahlil qilinmoqda...`);
 
         try {
-            const users = await fetchAllUsersWithRetry(DEFAULT_ADDRESS);
+            const users = await fetchAllUsers(DEFAULT_ADDRESS);
             const filtered = filterUsersByDateRange(users, start, end);
             if (filtered.length === 0) {
                 await ctx.reply(`⚠️ Ushbu oraliqda hech qanday lid topilmadi: ${start} — ${end}`);
@@ -236,14 +260,13 @@ bot.catch((err, ctx) => {
     ctx.reply('⚠️ Kutilmagan xatolik yuz berdi. Iltimos /start bilan qayta urining.');
 });
 
-// -------------------- HTTP HEALTH CHECK SERVER (Render uchun) --------------------
+// -------------------- HEALTH CHECK SERVER (Render uchun) --------------------
 const app = express();
 const PORT = process.env.PORT || 10000;
 
 app.get('/health', (req, res) => {
     res.status(200).send('Bot is running');
 });
-
 app.get('/', (req, res) => {
     res.status(200).send('Telegram bot is active');
 });
@@ -252,7 +275,7 @@ const server = app.listen(PORT, '0.0.0.0', () => {
     console.log(`✅ Health check server running on port ${PORT}`);
 });
 
-// Botni ishga tushirish (polling)
+// Botni ishga tushirish
 bot.launch().then(() => {
     console.log('✅ Telegram bot started');
 }).catch(err => {
