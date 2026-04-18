@@ -4,7 +4,9 @@ const axios = require('axios');
 const XLSX = require('xlsx');
 const fs = require('fs');
 const path = require('path');
+const express = require('express');
 
+// -------------------- TELEGRAM BOT --------------------
 const BOT_TOKEN = process.env.BOT_TOKEN;
 if (!BOT_TOKEN) {
     console.error('❌ BOT_TOKEN topilmadi! .env faylga yozing.');
@@ -12,14 +14,9 @@ if (!BOT_TOKEN) {
 }
 
 const bot = new Telegraf(BOT_TOKEN);
-
-// Session middleware - default obyekt bilan
 bot.use(session());
 bot.use((ctx, next) => {
-    // Agar session mavjud bo‘lmasa, default qiymat beramiz
-    if (!ctx.session) {
-        ctx.session = {};
-    }
+    if (!ctx.session) ctx.session = {};
     return next();
 });
 
@@ -27,46 +24,46 @@ const API_URL = 'https://b.kardioclinic.uz/userscha/address-a';
 const DEFAULT_LIMIT = 10000;
 const DEFAULT_ADDRESS = 'a';
 
-// Barcha foydalanuvchilarni paginatsiya bilan yuklash
-async function fetchAllUsers(address = DEFAULT_ADDRESS, limit = DEFAULT_LIMIT) {
+// Paginatsiya bilan barcha foydalanuvchilarni yuklash (timeout 60 sek, retry 3 marta)
+async function fetchAllUsersWithRetry(address = DEFAULT_ADDRESS, limit = DEFAULT_LIMIT, retries = 3) {
     let page = 1;
     let allUsers = [];
     let hasMore = true;
 
     while (hasMore) {
-        try {
-            const response = await axios.get(API_URL, {
-                params: {
-                    page: page,
-                    limit: limit,
-                    address: address,
-                },
-                timeout: 30000,
-            });
+        let attempt = 0;
+        let success = false;
+        let users = [];
 
-            const users = response.data.users || [];
-            if (users.length === 0) {
-                hasMore = false;
-                break;
+        while (attempt < retries && !success) {
+            try {
+                const response = await axios.get(API_URL, {
+                    params: { page, limit, address },
+                    timeout: 60000, // 60 sekund
+                });
+                users = response.data.users || [];
+                success = true;
+            } catch (error) {
+                attempt++;
+                console.error(`API xatosi (attempt ${attempt}/${retries}): ${error.message}`);
+                if (attempt === retries) throw new Error(`Ma'lumotlarni yuklab bo‘lmadi: ${error.message}`);
+                await new Promise(r => setTimeout(r, 2000)); // 2 sek kutish
             }
+        }
 
-            allUsers = allUsers.concat(users);
+        if (users.length === 0) break;
 
-            if (users.length < limit) {
-                hasMore = false;
-            } else {
-                page++;
-            }
-        } catch (error) {
-            console.error('API xatosi:', error.message);
-            throw new Error(`Ma'lumotlarni yuklab bo‘lmadi: ${error.message}`);
+        allUsers = allUsers.concat(users);
+        if (users.length < limit) {
+            hasMore = false;
+        } else {
+            page++;
         }
     }
-
     return allUsers;
 }
 
-// Excel fayl yaratish
+// Excel generatsiyasi
 function generateExcel(users, filename = 'users.xlsx') {
     const worksheetData = users.map(u => ({
         ID: u.id,
@@ -85,7 +82,6 @@ function generateExcel(users, filename = 'users.xlsx') {
     return filePath;
 }
 
-// Statistika (HTML)
 function getStatsByDate(users) {
     const dateCount = new Map();
     users.forEach(user => {
@@ -100,7 +96,6 @@ function getStatsByDate(users) {
     return statsText;
 }
 
-// Sana oralig‘i filtr
 function filterUsersByDateRange(users, startDate, endDate) {
     const start = new Date(startDate);
     const end = new Date(endDate);
@@ -115,7 +110,7 @@ function isValidDate(dateStr) {
     return /^\d{4}-\d{2}-\d{2}$/.test(dateStr);
 }
 
-// /start
+// Bot komandalari
 bot.start(async (ctx) => {
     await ctx.reply(
         '👋 <b>Kardioklinik Botiga xush kelibsiz!</b>\n\n' +
@@ -129,11 +124,10 @@ bot.start(async (ctx) => {
     );
 });
 
-// /all_excel
 bot.command('all_excel', async (ctx) => {
     const msg = await ctx.reply('⏳ Maʼlumotlar yuklanmoqda, iltimos kuting...');
     try {
-        const users = await fetchAllUsers(DEFAULT_ADDRESS);
+        const users = await fetchAllUsersWithRetry(DEFAULT_ADDRESS);
         if (!users.length) {
             await ctx.reply('Hech qanday foydalanuvchi topilmadi (address = a).');
             return;
@@ -148,11 +142,10 @@ bot.command('all_excel', async (ctx) => {
     }
 });
 
-// /all_stats
 bot.command('all_stats', async (ctx) => {
     const msg = await ctx.reply('⏳ Statistika tayyorlanmoqda...');
     try {
-        const users = await fetchAllUsers(DEFAULT_ADDRESS);
+        const users = await fetchAllUsersWithRetry(DEFAULT_ADDRESS);
         if (!users.length) {
             await ctx.reply('Hech qanday foydalanuvchi yo‘q (address = a).');
             return;
@@ -165,9 +158,7 @@ bot.command('all_stats', async (ctx) => {
     }
 });
 
-// /date_stats
 bot.command('date_stats', async (ctx) => {
-    // Session obyekti mavjudligiga ishonch hosil qilamiz
     if (!ctx.session) ctx.session = {};
     ctx.session.waitingForDateRange = true;
     ctx.session.dateStep = 'start';
@@ -180,7 +171,6 @@ bot.command('date_stats', async (ctx) => {
     );
 });
 
-// /cancel
 bot.command('cancel', async (ctx) => {
     if (ctx.session && ctx.session.waitingForDateRange) {
         ctx.session.waitingForDateRange = false;
@@ -191,11 +181,8 @@ bot.command('cancel', async (ctx) => {
     }
 });
 
-// Matnli xabarlar (sana kiritish)
 bot.on('text', async (ctx) => {
-    // Agar session yoki faol holat bo‘lmasa, hech narsa qilmaymiz
     if (!ctx.session || !ctx.session.waitingForDateRange) return;
-
     const text = ctx.message.text.trim();
 
     if (ctx.session.dateStep === 'start') {
@@ -227,17 +214,14 @@ bot.on('text', async (ctx) => {
         await ctx.reply(`⏳ ${start} dan ${end} gacha bo‘lgan maʼlumotlar tahlil qilinmoqda...`);
 
         try {
-            const users = await fetchAllUsers(DEFAULT_ADDRESS);
+            const users = await fetchAllUsersWithRetry(DEFAULT_ADDRESS);
             const filtered = filterUsersByDateRange(users, start, end);
-
             if (filtered.length === 0) {
                 await ctx.reply(`⚠️ Ushbu oraliqda hech qanday lid topilmadi: ${start} — ${end}`);
                 return;
             }
-
             const stats = getStatsByDate(filtered);
             await ctx.reply(stats, { parse_mode: 'HTML' });
-
             const filePath = generateExcel(filtered, `date_range_${start}_to_${end}.xlsx`);
             await ctx.replyWithDocument({ source: filePath, filename: `lidlar_${start}_${end}.xlsx` });
             fs.unlinkSync(filePath);
@@ -252,9 +236,36 @@ bot.catch((err, ctx) => {
     ctx.reply('⚠️ Kutilmagan xatolik yuz berdi. Iltimos /start bilan qayta urining.');
 });
 
-bot.launch().then(() => {
-    console.log('✅ Bot ishga tushdi (address = a)...');
+// -------------------- HTTP HEALTH CHECK SERVER (Render uchun) --------------------
+const app = express();
+const PORT = process.env.PORT || 10000;
+
+app.get('/health', (req, res) => {
+    res.status(200).send('Bot is running');
 });
 
-process.once('SIGINT', () => bot.stop('SIGINT'));
-process.once('SIGTERM', () => bot.stop('SIGTERM'));
+app.get('/', (req, res) => {
+    res.status(200).send('Telegram bot is active');
+});
+
+const server = app.listen(PORT, '0.0.0.0', () => {
+    console.log(`✅ Health check server running on port ${PORT}`);
+});
+
+// Botni ishga tushirish (polling)
+bot.launch().then(() => {
+    console.log('✅ Telegram bot started');
+}).catch(err => {
+    console.error('Bot launch error:', err);
+    server.close();
+    process.exit(1);
+});
+
+process.once('SIGINT', () => {
+    bot.stop('SIGINT');
+    server.close();
+});
+process.once('SIGTERM', () => {
+    bot.stop('SIGTERM');
+    server.close();
+});
